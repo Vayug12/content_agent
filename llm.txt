@@ -1,0 +1,96 @@
+CreatorAgent — AI Short Video Generator
+========================================
+
+WHAT IT IS:
+  CreatorAgent is an AI-powered short video generation platform.
+  User types a topic idea or pastes a script → backend produces a finished
+  60-second vertical MP4 video (YouTube Shorts / TikTok / Reels format)
+  with stock footage, AI voiceover, text overlays, Ken Burns effects,
+  and crossfade transitions.
+
+SCOPE:
+  Topic/script in → MP4 out. No publishing, no streaming, no analytics,
+  no social features, no authentication.
+
+TECH STACK:
+  Backend:  Python, FastAPI (port 7860), Groq LLM (llama-3.3-70b-versatile),
+            Edge TTS (en-US-AriaNeural), MoviePy, Pillow, Pexels/Pixabay/Wikimedia
+  Database: SQLite (single file, zero setup, auto-created at data/creatoragent.db)
+  Storage:  Cloudflare R2 (S3-compatible via boto3, auto-expire lifecycle)
+  Frontend: Flutter/Dart (Material 3, no dark mode, Inter font)
+  Deploy:   Docker (Python 3.11-slim + ffmpeg)
+
+PROJECT STRUCTURE:
+  content_agent/          # Python backend
+    agents/               # AI pipeline agents (topic, research, script, clips, voice, video)
+    utils/                # Jobs (SQLite CRUD), Storage (R2), Logger
+    api.py                # FastAPI app + background worker thread
+    pipeline.py           # End-to-end job orchestration
+    config.py             # Environment + generation constants
+    Dockerfile            # Container build
+  app/                    # Flutter mobile app
+    lib/
+      main.dart           # Entry point
+      core/               # Config, theme tokens, app theme
+      data/               # API client, models, device ID, video file service
+      ui/screens/         # Hub, Generating, VideoDetail, Library screens
+      ui/widgets/         # Reusable widgets (cards, skeletons, toggles)
+
+API ENDPOINTS:
+  GET  /health                    — Liveness check
+  GET  /topics/suggestions        — AI topic ideas (query: count, category)
+  POST /jobs                      — Queue video job (body: user_id, prompt?)
+  GET  /jobs/{job_id}?user_id=X   — Poll job progress
+  GET  /jobs?user_id=X&limit=N    — User's library
+  DELETE /jobs/{job_id}?user_id=X — Delete job + R2 object
+
+  All endpoints except /health require X-API-Key header when API_KEY is set.
+
+JOB LIFECYCLE:
+  queued → scripting → clips → voice → rendering → uploading → done
+
+VIDEO PIPELINE:
+  1. Topic suggestion (Groq LLM, 15 categories)
+  2. Prompt enhancement (user idea → structured topic)
+  3. Research (facts, stats, trends, controversial angles)
+  4. Script writing (8-12 scenes, ~60s, with search queries per scene)
+  5. Clip fetching (Pexels → Pixabay → Wikimedia, portrait-first, 30MB cap)
+  6. Voice generation (Edge TTS per scene)
+  7. Video editing (MoviePy: Ken Burns, center-crop, text overlays, 0.5s crossfades)
+  8. Upload to R2 → return URL
+
+ALTERNATIVE PATH:
+  Script-to-Video: User pastes script → LLM splits into scenes preserving exact words
+  → duration from word count (2.5 words/sec) → same downstream pipeline
+
+ENVIRONMENT VARIABLES:
+  GROQ_API_KEY        — Required. Groq LLM access.
+  R2_ACCOUNT_ID       — Required. Cloudflare R2.
+  R2_ACCESS_KEY_ID    — Required. R2 auth.
+  R2_SECRET_ACCESS_KEY— Required. R2 auth.
+  R2_BUCKET           — Required. R2 bucket name.
+  R2_PUBLIC_BASE_URL  — Optional. Permanent URLs (otherwise presigned).
+  R2_RETENTION_DAYS   — Optional. Auto-delete after N days (default 7).
+  API_KEY             — Optional. Shared secret for API access.
+  PEXELS_API_KEY      — Optional. Primary clip source.
+  PIXABAY_API_KEY     — Optional. Fallback clip source.
+  DB_PATH             — Optional. SQLite file path (default: data/creatoragent.db).
+
+STORAGE:
+  R2 is a handoff buffer, not a library. Videos auto-expire via lifecycle rule.
+  Job metadata persists in SQLite. ~15MB per 60s video. No egress costs.
+
+DESIGN:
+  ChatGPT/Apple/Linear/Notion-inspired minimal aesthetic. 8-point grid.
+  Single green accent: #10A37F. Light-only. Skeleton loading. No dark mode.
+
+KNOWN LIMITATIONS (INTENTIONAL):
+  - No real auth (user_id is caller-provided)
+  - No rate limiting or quotas
+  - No moderation on prompts/scripts
+  - Single worker per process (no concurrent renders)
+  - Groq free tier rate limits under load
+
+DOCS:
+  docs/overview.md       — Full architecture, tech stack, deployment guide
+  docs/api-reference.md  — Detailed API docs with request/response examples

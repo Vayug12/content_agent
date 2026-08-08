@@ -5,7 +5,6 @@ from moviepy import (
     CompositeVideoClip, concatenate_videoclips
 )
 from moviepy.video.fx import CrossFadeIn
-from config import OUTPUT_DIR
 from utils.logger import log
 
 
@@ -166,13 +165,13 @@ def create_text_clip(duration: float) -> ColorClip:
 
 # ==================== PROCESS SCENE ====================
 
-def process_scene(scene: dict, clip_data: dict, voice_path: str) -> str:
+def process_scene(scene: dict, clip_data: dict, voice_path: str, out_dir: str) -> str:
     """Process single scene with Ken Burns + subtle text overlay"""
     num = scene["scene_number"]
     clip_path = clip_data.get("path", "")
     target_duration = scene["duration"]
     narration = scene.get("narration", "")
-    temp_output = os.path.join(OUTPUT_DIR, f"scene_{num}.mp4")
+    temp_output = os.path.join(out_dir, f"scene_{num}.mp4")
 
     try:
         if clip_path and os.path.exists(clip_path):
@@ -216,7 +215,7 @@ def process_scene(scene: dict, clip_data: dict, voice_path: str) -> str:
 
 # ==================== EDIT VIDEO ====================
 
-def edit_video(scenes: list, clips: list, voices: list) -> str:
+def edit_video(scenes: list, clips: list, voices: list, out_dir: str) -> str:
     """Main video editing with Ken Burns, crossfade, and text overlays"""
     log("EDIT", "Starting professional video assembly...")
 
@@ -229,7 +228,7 @@ def edit_video(scenes: list, clips: list, voices: list) -> str:
         clip_data = clip_map.get(num, {})
         voice_path = voice_map.get(num, "")
 
-        temp_path = process_scene(scene, clip_data, voice_path)
+        temp_path = process_scene(scene, clip_data, voice_path, out_dir)
         if temp_path:
             temp_files.append(temp_path)
 
@@ -237,7 +236,7 @@ def edit_video(scenes: list, clips: list, voices: list) -> str:
         log("EDIT", "No clips to merge!")
         return ""
 
-    final_output = os.path.join(OUTPUT_DIR, "final_video.mp4")
+    final_output = os.path.join(out_dir, "final_video.mp4")
     log("EDIT", f"Concatenating {len(temp_files)} scenes with crossfade...")
 
     clips_to_merge = []

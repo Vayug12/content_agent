@@ -1,18 +1,26 @@
 import os
 import re
+import json
 import time
-import subprocess
+from urllib.parse import urlparse
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import yt_dlp
 from config import (
-    PEXELS_API_KEY, OUTPUT_DIR,
-    YOUTUBE_MAX_FILESIZE, YOUTUBE_SEARCH_COUNT,
-    YOUTUBE_MIN_DURATION, YOUTUBE_MAX_DURATION,
-    YOUTUBE_MAX_HEIGHT
+    PEXELS_API_KEY, PIXABAY_API_KEY,
+    CLIP_MAX_FILESIZE, CLIP_SEARCH_COUNT, CLIP_MIN_HEIGHT
 )
 from utils.logger import log
+
+
+# Wikimedia descriptive User-Agent maangta hai, warna 403 deta hai
+USER_AGENT = "creatoragent/1.0 (automated content pipeline)"
+
+VIDEO_EXTENSIONS = (".mp4", ".webm", ".ogv", ".mov", ".m4v")
+
+
+class ClipTooLarge(Exception):
+    """Clip file size cap se bada hai - retry karne ka fayda nahi"""
 
 
 def get_session():
@@ -21,179 +29,78 @@ def get_session():
     adapter = HTTPAdapter(max_retries=retries)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
     return session
 
 
-# ==================== YOUTUBE FUNCTIONS ====================
+def pick_best_file(files: list) -> dict:
+    """Sabse chhota file jo CLIP_MIN_HEIGHT se bada ho - warna jo sabse bada mile.
 
-def search_youtube(query: str, max_results: int = YOUTUBE_SEARCH_COUNT) -> list:
-    """YouTube pe video search karo - any video, not just stock footage"""
-    log("CLIPS", f"YouTube search: '{query}'")
-
-    search_query = f"{query}"
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'extract_flat': True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(f"ytsearch{max_results}:{search_query}", download=False)
-
-        entries = result.get('entries', [])
-        filtered = []
-
-        for r in entries:
-            duration = r.get('duration', 0) or 0
-            if duration and YOUTUBE_MIN_DURATION <= duration <= YOUTUBE_MAX_DURATION:
-                filtered.append({
-                    'url': f"https://www.youtube.com/watch?v={r['id']}",
-                    'title': r.get('title', 'Unknown'),
-                    'duration': duration,
-                    'channel': r.get('channel', 'Unknown') or r.get('uploader', 'Unknown'),
-                    'view_count': r.get('view_count', 0) or 0,
-                })
-
-        log("CLIPS", f"YouTube: {len(filtered)} videos found")
-        return filtered
-
-    except Exception as e:
-        log("CLIPS", f"YouTube search error: {str(e)}")
-        return []
+    Purana code hamesha max height leta tha, jisse 4K files download hoti thi
+    aur size cap cross ho jata tha. Ye version quality/size balance karta hai.
+    """
+    usable = [f for f in files if f.get("height", 0) >= CLIP_MIN_HEIGHT]
+    if usable:
+        return min(usable, key=lambda f: f["height"])
+    if files:
+        return max(files, key=lambda f: f.get("height", 0))
+    return {}
 
 
-def download_youtube_clip(url: str, filename: str) -> str:
-    """YouTube video download karo - MUTED (sirf visual)"""
-    output_path = os.path.join(OUTPUT_DIR, filename)
-
-    ydl_opts = {
-        'format': f'bestvideo[height<={YOUTUBE_MAX_HEIGHT}][ext=mp4]/bestvideo[height<={YOUTUBE_MAX_HEIGHT}]/best',
-        'outtmpl': output_path,
-        'merge_output_format': 'mp4',
-        'max_filesize': YOUTUBE_MAX_FILESIZE,
-        'no_warnings': True,
-        'quiet': True,
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        if os.path.exists(output_path):
-            mute_video(output_path)
-            log("CLIPS", f"YouTube downloaded + muted: {filename}")
-            return output_path
-
-    except Exception as e:
-        log("CLIPS", f"YouTube download error: {str(e)}")
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-    return ""
+def strip_html(value: str) -> str:
+    """Wikimedia ke extmetadata fields me HTML hota hai - plain text nikalo"""
+    return re.sub(r"<[^>]+>", "", value or "").strip() or "Unknown"
 
 
-def mute_video(video_path: str):
-    """Video se audio remove karo using FFmpeg - guaranteed mute"""
-    temp_path = video_path + ".temp.mp4"
+# ==================== SOURCE 1: PEXELS ====================
 
-    try:
-        cmd = [
-            "ffmpeg", "-i", video_path,
-            "-an",
-            "-c:v", "copy",
-            "-y",
-            temp_path
-        ]
-        subprocess.run(cmd, capture_output=True, timeout=60)
-
-        if os.path.exists(temp_path):
-            os.replace(temp_path, video_path)
-    except Exception as e:
-        log("CLIPS", f"Mute error: {str(e)}")
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-def trim_to_short_clip(video_path: str, target_duration: float) -> str:
-    """Video ko scene duration ke according trim karo (middle section - best action)"""
-    from moviepy import VideoFileClip
-
-    try:
-        clip = VideoFileClip(video_path)
-        total_duration = clip.duration
-
-        # Agar clip already chota hai toh as-is use karo
-        if total_duration <= target_duration:
-            clip = clip.without_audio()
-            clip.close()
-            return video_path
-
-        # Middle section se trim karo (usually best action hota hai)
-        start_time = (total_duration - target_duration) / 2
-        end_time = start_time + target_duration
-
-        trimmed = clip.subclipped(start_time, end_time)
-        trimmed = trimmed.without_audio()
-
-        trimmed_path = video_path.replace(".mp4", "_trimmed.mp4")
-        trimmed.write_videofile(
-            trimmed_path,
-            fps=30,
-            codec="libx264",
-            audio_codec="aac",
-            logger=None
-        )
-
-        clip.close()
-        trimmed.close()
-
-        os.remove(video_path)
-        log("CLIPS", f"Trimmed: {total_duration:.1f}s -> {target_duration:.1f}s")
-        return trimmed_path
-
-    except Exception as e:
-        log("CLIPS", f"Trim error: {str(e)}")
-        return video_path
-
-
-# ==================== PEXELS FUNCTIONS ====================
-
-def search_pexels(query: str, count: int = 2) -> list:
-    """Pexels API se stock footage search karo (fallback)"""
+def search_pexels(query: str, count: int = CLIP_SEARCH_COUNT) -> list:
+    """Pexels API se stock footage search karo (primary source)"""
     if not PEXELS_API_KEY:
         log("CLIPS", "Pexels API key not set, skipping Pexels")
         return []
 
-    headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": query, "per_page": count, "orientation": "portrait"}
-
     session = get_session()
-    try:
+
+    def request(params: dict) -> list:
         response = session.get(
             "https://api.pexels.com/videos/search",
-            headers=headers,
+            headers={"Authorization": PEXELS_API_KEY},
             params=params,
             timeout=30
         )
-
         if response.status_code != 200:
-            log("CLIPS", f"Pexels search failed for: {query}")
+            log("CLIPS", f"Pexels search failed ({response.status_code}) for: {query}")
             return []
 
-        data = response.json()
         clips = []
-
-        for video in data.get("videos", []):
-            best_file = max(video.get("video_files", []),
-                            key=lambda f: f.get("height", 0))
-            if best_file:
+        for video in response.json().get("videos", []):
+            best = pick_best_file([
+                {
+                    "url": f["link"],
+                    "width": f.get("width") or 0,
+                    "height": f.get("height") or 0,
+                }
+                for f in video.get("video_files", []) if f.get("link")
+            ])
+            if best:
                 clips.append({
-                    "url": best_file["link"],
-                    "width": best_file.get("width", 0),
-                    "height": best_file.get("height", 0),
-                    "duration": video.get("duration", 0)
+                    **best,
+                    "duration": video.get("duration", 0),
+                    "source": "Pexels",
+                    "credit": (video.get("user") or {}).get("name", "Unknown"),
+                    "license": "Pexels License",
+                    "page": video.get("url", ""),
                 })
+        return clips
+
+    try:
+        base = {"query": query, "per_page": count}
+        # Output portrait hai, toh pehle portrait try karo
+        clips = request({**base, "orientation": "portrait"})
+        # Portrait me kuch na mile toh landscape bhi chalega (editor center-crop karta hai)
+        if not clips:
+            clips = request(base)
 
         log("CLIPS", f"Pexels: {len(clips)} clips found")
         return clips
@@ -203,71 +110,232 @@ def search_pexels(query: str, count: int = 2) -> list:
         return []
 
 
-def download_clip(url: str, filename: str, max_retries: int = 3) -> str:
-    """Generic video download function"""
-    output_path = os.path.join(OUTPUT_DIR, filename)
+# ==================== SOURCE 2: PIXABAY ====================
+
+def search_pixabay(query: str, count: int = CLIP_SEARCH_COUNT) -> list:
+    """Pixabay API se stock footage search karo (fallback)"""
+    if not PIXABAY_API_KEY:
+        log("CLIPS", "Pixabay API key not set, skipping Pixabay")
+        return []
+
+    session = get_session()
+    try:
+        response = session.get(
+            "https://pixabay.com/api/videos/",
+            params={
+                "key": PIXABAY_API_KEY,
+                "q": query,
+                "per_page": max(count, 3),  # Pixabay ka minimum 3 hai
+                "video_type": "film",
+                "safesearch": "true",
+            },
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            log("CLIPS", f"Pixabay search failed ({response.status_code}) for: {query}")
+            return []
+
+        clips = []
+        for hit in response.json().get("hits", [])[:count]:
+            best = pick_best_file([
+                {
+                    "url": v["url"],
+                    "width": v.get("width") or 0,
+                    "height": v.get("height") or 0,
+                }
+                for v in (hit.get("videos") or {}).values() if v.get("url")
+            ])
+            if best:
+                clips.append({
+                    **best,
+                    "duration": hit.get("duration", 0),
+                    "source": "Pixabay",
+                    "credit": hit.get("user", "Unknown"),
+                    "license": "Pixabay Content License",
+                    "page": hit.get("pageURL", ""),
+                })
+
+        log("CLIPS", f"Pixabay: {len(clips)} clips found")
+        return clips
+
+    except Exception as e:
+        log("CLIPS", f"Pixabay search error: {str(e)}")
+        return []
+
+
+# ==================== SOURCE 3: WIKIMEDIA COMMONS ====================
+
+def search_wikimedia(query: str, count: int = CLIP_SEARCH_COUNT) -> list:
+    """Wikimedia Commons se CC-licensed video - koi API key nahi chahiye.
+
+    Stock libraries me jo nahi milta (real events, places, science footage)
+    wo yahan mil jata hai. Quality mixed hoti hai, isliye last fallback hai.
+    """
+    session = get_session()
+    try:
+        response = session.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action": "query",
+                "format": "json",
+                "generator": "search",
+                "gsrsearch": f"filetype:video {query}",
+                "gsrnamespace": 6,  # File: namespace
+                "gsrlimit": count,
+                "prop": "imageinfo",
+                "iiprop": "url|size|mime|extmetadata",
+            },
+            timeout=30
+        )
+
+        if response.status_code != 200:
+            log("CLIPS", f"Wikimedia search failed ({response.status_code}) for: {query}")
+            return []
+
+        pages = (response.json().get("query") or {}).get("pages", {})
+        clips = []
+
+        for page in pages.values():
+            info = (page.get("imageinfo") or [{}])[0]
+            url = info.get("url", "")
+            if not url:
+                continue
+
+            # Commons pe files bahut badi ho sakti hai - download se pehle hi skip karo
+            if info.get("size", 0) > CLIP_MAX_FILESIZE:
+                continue
+
+            meta = info.get("extmetadata") or {}
+            clips.append({
+                "url": url,
+                "width": info.get("width", 0),
+                "height": info.get("height", 0),
+                "duration": info.get("duration", 0) or 0,
+                "source": "Wikimedia Commons",
+                "credit": strip_html((meta.get("Artist") or {}).get("value", "")),
+                "license": strip_html((meta.get("LicenseShortName") or {}).get("value", "")),
+                "page": page.get("title", ""),
+            })
+
+        log("CLIPS", f"Wikimedia: {len(clips)} clips found")
+        return clips
+
+    except Exception as e:
+        log("CLIPS", f"Wikimedia search error: {str(e)}")
+        return []
+
+
+# ==================== DOWNLOAD ====================
+
+def download_clip(url: str, name: str, out_dir: str, max_retries: int = 3) -> str:
+    """Generic video download - size cap ke saath, extension URL se leta hai"""
+    ext = os.path.splitext(urlparse(url).path)[1].lower()
+    if ext not in VIDEO_EXTENSIONS:
+        ext = ".mp4"
+
+    output_path = os.path.join(out_dir, f"{name}{ext}")
 
     for attempt in range(max_retries):
+        written = 0
         try:
             session = get_session()
-            response = session.get(url, stream=True, timeout=60)
+            with session.get(url, stream=True, timeout=60) as response:
+                if response.status_code != 200:
+                    log("CLIPS", f"Download failed ({response.status_code}): {name}")
+                    return ""
 
-            if response.status_code == 200:
                 with open(output_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
-                log("CLIPS", f"Downloaded: {filename}")
-                return output_path
+                        written += len(chunk)
+                        if written > CLIP_MAX_FILESIZE:
+                            raise ClipTooLarge(
+                                f"{written // (1024 * 1024)}MB > "
+                                f"{CLIP_MAX_FILESIZE // (1024 * 1024)}MB cap"
+                            )
+
+            log("CLIPS", f"Downloaded: {name}{ext} ({written // 1024}KB)")
+            return output_path
+
+        except ClipTooLarge as e:
+            # Size cap har attempt me same rahega - retry mat karo
+            log("CLIPS", f"Skipped (too large): {name} - {str(e)}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            return ""
 
         except (requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as e:
-            log("CLIPS", f"Download error (attempt {attempt + 1}/{max_retries}): {filename}")
+            log("CLIPS", f"Download error (attempt {attempt + 1}/{max_retries}): {name} - {str(e)}")
             if os.path.exists(output_path):
                 os.remove(output_path)
             time.sleep(2)
 
-    log("CLIPS", f"Failed to download after {max_retries} attempts: {filename}")
+    log("CLIPS", f"Failed to download after {max_retries} attempts: {name}")
     return ""
 
 
 # ==================== MAIN FETCH FUNCTION ====================
 
-def fetch_all_clips(scenes: list) -> list:
-    """Multi-source clip fetcher - YouTube first, Pexels fallback"""
-    log("CLIPS", "Fetching clips from YouTube + Pexels...")
+# Priority order - pehla source jo clip de deta hai wahi use hota hai
+SOURCES = [
+    ("Pexels", search_pexels),
+    ("Pixabay", search_pixabay),
+    ("Wikimedia Commons", search_wikimedia),
+]
+
+
+def save_attributions(entries: list, out_dir: str):
+    """CC-licensed clips ke liye attribution file - Wikimedia ke liye zaroori hai"""
+    if not entries:
+        return
+
+    path = os.path.join(out_dir, "attributions.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2, ensure_ascii=False)
+        log("CLIPS", f"Attributions saved: {len(entries)} clips")
+    except Exception as e:
+        log("CLIPS", f"Attribution save error: {str(e)}")
+
+
+def fetch_all_clips(scenes: list, out_dir: str) -> list:
+    """Multi-source clip fetcher - Pexels primary, Pixabay + Wikimedia fallback"""
+    log("CLIPS", "Fetching clips from Pexels + Pixabay + Wikimedia Commons...")
     downloaded = []
+    attributions = []
 
     for i, scene in enumerate(scenes):
         query = scene["clip_search_query"]
-        scene_duration = scene["duration"]
         log("CLIPS", f"Scene {i+1}: searching '{query}'")
 
         clip_path = ""
 
-        # SOURCE 1: YouTube (primary - any video)
-        yt_clips = search_youtube(query, max_results=3)
-        if yt_clips:
-            # Best clip select karo (most views)
-            best = max(yt_clips, key=lambda x: x['view_count'])
-            filename = f"clip_{i+1}.mp4"
-            path = download_youtube_clip(best['url'], filename)
+        for source_name, search_fn in SOURCES:
+            if clip_path:
+                break
 
-            if path:
-                # Trim to scene duration (dynamic - 4-8 seconds)
-                clip_path = trim_to_short_clip(path, target_duration=scene_duration)
-                log("CLIPS", f"Scene {i+1}: YouTube clip used ({best['title'][:40]})")
+            # Ek source ke saare candidates try karo, phir agle source pe jao
+            for candidate in search_fn(query):
+                path = download_clip(candidate["url"], f"clip_{i+1}", out_dir)
+                if path:
+                    clip_path = path
+                    log("CLIPS", f"Scene {i+1}: {source_name} clip used "
+                                 f"({candidate['credit']})")
+                    attributions.append({
+                        "scene_number": scene["scene_number"],
+                        "query": query,
+                        "source": candidate["source"],
+                        "credit": candidate["credit"],
+                        "license": candidate.get("license", ""),
+                        "page": candidate.get("page", ""),
+                    })
+                    break
 
-        # SOURCE 2: Pexels (fallback - stock footage)
         if not clip_path:
-            pexels_clips = search_pexels(query, count=1)
-            if pexels_clips:
-                filename = f"clip_{i+1}.mp4"
-                clip_path = download_clip(pexels_clips[0]['url'], filename)
-                log("CLIPS", f"Scene {i+1}: Pexels clip used")
-
-        if not clip_path:
-            log("CLIPS", f"Scene {i+1}: No clips found")
+            log("CLIPS", f"Scene {i+1}: No clips found for '{query}'")
 
         downloaded.append({
             "scene_number": scene["scene_number"],
@@ -275,7 +343,8 @@ def fetch_all_clips(scenes: list) -> list:
             "duration": scene["duration"]
         })
 
-        # Rate limiting - YouTube ke liye
+        # Rate limiting - free tier APIs ke liye
         time.sleep(1)
 
+    save_attributions(attributions, out_dir)
     return downloaded

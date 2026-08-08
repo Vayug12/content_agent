@@ -1,9 +1,15 @@
+"""Topic suggestions for the picker screen.
+
+Pehle ye autonomous channel ke liye ek topic choose karta tha (globally used
+topics avoid karke). Ab user choose karta hai, isliye ye sirf suggestions deta hai.
+"""
+
 import json
+import re
 import random
 from groq import Groq
 from config import GROQ_API_KEY, GROQ_MODEL
 from utils.logger import log
-from utils.memory import get_used_topics
 
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -22,53 +28,49 @@ CATEGORIES = [
     "Open Source Tools",
     "Career in Tech",
     "Productivity for Developers",
-    "AI Tools & Automation"
+    "AI Tools & Automation",
 ]
 
-SYSTEM_PROMPT = """You are a YouTube Shorts topic selector for a tech-focused channel.
+SYSTEM_PROMPT = """You suggest short-form video topics a creator can make in 60 seconds.
+
 Return JSON only:
 {
-  "topic": "specific topic string",
-  "category": "category name from the list provided",
-  "keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
-  "audience": "target audience",
-  "hook": "first 3 second attention-grabbing line"
+  "topics": [
+    {"topic": "specific topic string", "category": "category name", "hook": "first 3 second attention-grabbing line"}
+  ]
 }
 
 Rules:
-- Topic must be specific and actionable (not generic)
-- Must be relevant to 2026
+- Each topic must be specific and actionable, never generic
 - Should make viewers think "I didn't know this" or "I need this"
-- Keep it viral-worthy and interesting
-- DO NOT repeat any topics from the "Already used topics" list
-- Examples of good topics:
-  - "5 VS Code Extensions That Save 10 Hours/Week"
-  - "Why Rust is Replacing C++ in 2026"
-  - "How I Built a SaaS in 7 Days Using AI"
-  - "The AI Tool That Replaced My Entire Dev Team"
-  - "Linux Commands Every Developer Must Know"
-"""
+- Vary the angle across suggestions - do not return near-duplicates
+- Return ONLY valid JSON, no extra text"""
 
 
-def select_topic() -> dict:
-    log("TOPIC", "Selecting trending topic...")
+def suggest_topics(count: int = 6, category: str = None) -> list:
+    """Picker screen ke liye topic suggestions."""
+    chosen = category or random.choice(CATEGORIES)
+    log("TOPIC", f"Suggesting {count} topics for: {chosen}")
 
-    category = random.choice(CATEGORIES)
-    log("TOPIC", f"Category: {category}")
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Category: {chosen}\n\nSuggest {count} topics. Return JSON only."}
+            ],
+            temperature=0.9,
+            max_tokens=800
+        )
 
-    used_topics = get_used_topics()
-    used_text = "\n".join([f"- {t}" for t in used_topics[-20:]]) if used_topics else "None yet"
+        content = response.choices[0].message.content
+        match = re.search(r'\{[\s\S]*\}', re.sub(r'```(json)?', '', content))
+        result = json.loads(match.group() if match else content)
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Category: {category}\n\nAlready used topics (DO NOT repeat these):\n{used_text}\n\nPick a NEW, unique, viral-worthy topic for a 60-second YouTube Short. Return JSON only."}
-        ],
-        temperature=0.9,
-        max_tokens=400
-    )
+        topics = result.get("topics", [])[:count]
+        log("TOPIC", f"Suggested {len(topics)} topics")
+        return topics
 
-    result = json.loads(response.choices[0].message.content)
-    log("TOPIC", f"Selected: {result['topic']}")
-    return result
+    except (json.JSONDecodeError, KeyError, AttributeError) as e:
+        log("TOPIC", f"Suggestion error: {str(e)}")
+        return []

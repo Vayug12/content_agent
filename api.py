@@ -1,29 +1,35 @@
+"""Content agent API.
+
+Product surface: user topic choose karta hai ya apna script deta hai,
+service video banati hai, user download / share karta hai. Bas.
+"""
+
 import os
-import json
-import requests
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+import time
+import threading
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, FileResponse
 from pydantic import BaseModel
-from typing import Optional, List
-from config import OUTPUT_DIR
+from pathlib import Path
+from config import API_KEY, MAX_SCRIPT_CHARS
 from utils.logger import log
-from agents.topic_selector import select_topic
-from agents.research_agent import research_topic
-from agents.script_writer import write_script
-from agents.review_agent import review_script, review_assets
-from agents.clip_fetcher import fetch_all_clips
-from agents.voice_generator import generate_all_voices
-from agents.video_editor import edit_video
-from agents.publishing_agent import generate_metadata, publish_to_vayug, upload_download_copy
-from agents.analytics_agent import analyze_performance
-from agents.prompt_enhancer import enhance_prompt
-from utils.memory import add_to_memory, get_memory_stats, add_pipeline_run, get_all_topics
+from utils.jobs import (
+    create_job, claim_next_job, get_job, list_jobs, delete_job
+)
+from utils.storage import delete_video, is_configured as storage_ready
+from agents.topic_selector import suggest_topics
+from pipeline import run_job
 
 app = FastAPI(
-    title="VayugAI API",
-    description="REST API wrapper for VayugAI content generation agents",
-    version="1.0.0"
+    title="Content Agent API",
+    description="Generate short videos from a topic or your own script",
+    version="2.0.0"
 )
+
+DOCS_DIR = Path(__file__).parent.parent / "docs"
+LLM_TXT = Path(__file__).parent.parent / "llm.txt"
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,444 +40,149 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-def read_root():
-    return {"status": "healthy", "message": "Vayu AI Agent is running"}
+@app.get("/llm.txt", response_class=PlainTextResponse)
+def llm_txt():
+    """AI agents ke liye quick app reference."""
+    if not LLM_TXT.exists():
+        raise HTTPException(status_code=404, detail="llm.txt not found")
+    return PlainTextResponse(LLM_TXT.read_text(encoding="utf-8"))
 
 
-class TopicRequest(BaseModel):
-    category: Optional[str] = None
+@app.get("/docs/{filename}")
+def serve_docs(filename: str):
+    """Human-readable documentation pages."""
+    file_path = DOCS_DIR / filename
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Doc not found")
+    return FileResponse(file_path, media_type="text/markdown")
 
 
-class ResearchRequest(BaseModel):
-    topic: str
-    category: Optional[str] = "Unknown"
-    keywords: Optional[List[str]] = []
+def require_key(x_api_key: Optional[str]):
+    """Shared secret. Real per-user auth abhi baaki hai - dekho README."""
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-class ScriptRequest(BaseModel):
-    topic: str
-    category: Optional[str] = "Unknown"
-    keywords: Optional[List[str]] = []
-    audience: Optional[str] = "Tech enthusiasts"
+# ==================== WORKER ====================
+
+_worker_started = False
 
 
-class ReviewRequest(BaseModel):
-    script_data: dict
-    research_data: dict
+def worker_loop():
+    """Queued jobs uthao aur ek-ek karke chalao.
+
+    Ek worker = ek render at a time. Rendering CPU-bound hai, parallel
+    chalane se dono slow ho jaate hai. Zyada throughput chahiye toh aur
+    worker process chalao (claim_next_job ka note padho pehle).
+    """
+    log("WORKER", "Worker started")
+    while True:
+        try:
+            job = claim_next_job()
+            if job:
+                run_job(job)
+            else:
+                time.sleep(5)
+        except Exception as e:
+            log("WORKER", f"Loop error: {str(e)}")
+            time.sleep(5)
 
 
-class ClipsRequest(BaseModel):
-    scenes: list
+@app.on_event("startup")
+def start_worker():
+    global _worker_started
+    if not _worker_started:
+        threading.Thread(target=worker_loop, daemon=True).start()
+        _worker_started = True
 
 
-class VoiceRequest(BaseModel):
-    scenes: list
+# ==================== MODELS ====================
+
+class JobRequest(BaseModel):
+    user_id: str
+    prompt: Optional[str] = ""   # Topic ya idea
+    script: Optional[str] = ""   # User ka apna script (optional)
 
 
-class EditRequest(BaseModel):
-    scenes: list
-    clips: list
-    voices: list
-
-
-class MetadataRequest(BaseModel):
-    script_data: dict
-    research_data: dict
-
-
-class PublishRequest(BaseModel):
-    video_path: str
-    metadata: dict
-
-
-class GenerateRequest(BaseModel):
-    prompt: str
-    category: Optional[str] = None
-    audience: Optional[str] = None
-    skip_publish: Optional[bool] = False
-    # Set by the Vayug backend so the agent can report completion back to it.
-    job_id: Optional[str] = None
-    callback_url: Optional[str] = None
-    callback_secret: Optional[str] = None
-
-
-class PipelineRequest(BaseModel):
-    topic: Optional[str] = None
-    category: Optional[str] = None
-    keywords: Optional[List[str]] = []
-    audience: Optional[str] = "Tech enthusiasts"
-    skip_publish: Optional[bool] = False
-
+# ==================== ENDPOINTS ====================
 
 @app.get("/health")
-def health_check():
-    return {"status": "healthy", "service": "VayugAI API"}
-
-
-@app.get("/stats")
-def get_stats():
-    stats = get_memory_stats()
+def health():
     return {
-        "total_runs": stats["total_runs"],
-        "topics_used": stats["topics_used"]
+        "status": "healthy",
+        "storage_configured": storage_ready(),
     }
 
 
-@app.get("/topics")
-def get_topics(limit: int = 20):
-    topics = get_all_topics(limit=limit)
-    return {"topics": topics}
+@app.get("/topics/suggestions")
+def topic_suggestions(
+    count: int = Query(6, ge=1, le=12),
+    category: Optional[str] = None,
+    x_api_key: Optional[str] = Header(None),
+):
+    """Picker screen ke liye topic suggestions."""
+    require_key(x_api_key)
+    return {"topics": suggest_topics(count=count, category=category)}
 
 
-@app.post("/topic")
-def create_topic(request: TopicRequest = None):
-    try:
-        topic_data = select_topic()
-        add_to_memory(topic_data)
-        return {"success": True, "data": topic_data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/jobs", status_code=202)
+def submit_job(request: JobRequest, x_api_key: Optional[str] = Header(None)):
+    """Video generation queue me daalo. Turant job_id milta hai."""
+    require_key(x_api_key)
 
-
-@app.post("/research")
-def create_research(request: ResearchRequest):
-    try:
-        topic_data = {
-            "topic": request.topic,
-            "category": request.category,
-            "keywords": request.keywords
-        }
-        research_data = research_topic(topic_data)
-        return {"success": True, "data": research_data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/script")
-def create_script(request: ScriptRequest):
-    try:
-        topic_data = {
-            "topic": request.topic,
-            "category": request.category,
-            "keywords": request.keywords,
-            "audience": request.audience
-        }
-        script_data = write_script(topic_data)
-        return {"success": True, "data": script_data}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/review")
-def create_review(request: ReviewRequest):
-    try:
-        review_result = review_script(request.script_data, request.research_data)
-        return {"success": True, "data": review_result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/clips")
-def create_clips(request: ClipsRequest):
-    try:
-        clips = fetch_all_clips(request.scenes)
-        return {"success": True, "data": clips}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/voice")
-def create_voice(request: VoiceRequest):
-    try:
-        voices = generate_all_voices(request.scenes)
-        return {"success": True, "data": voices}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/edit")
-def create_edit(request: EditRequest):
-    try:
-        final_video = edit_video(request.scenes, request.clips, request.voices)
-        return {"success": True, "data": {"video_path": final_video}}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/metadata")
-def create_metadata(request: MetadataRequest):
-    try:
-        metadata = generate_metadata(request.script_data, request.research_data)
-        return {"success": True, "data": metadata}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/publish")
-def create_publish(request: PublishRequest):
-    try:
-        result = publish_to_vayug(request.video_path, request.metadata)
-        return {"success": True, "data": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/analytics")
-def create_analytics():
-    try:
-        result = analyze_performance()
-        return {"success": True, "data": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def run_full_pipeline_sync(request: PipelineRequest):
-    try:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-        if request.topic:
-            topic_data = {
-                "topic": request.topic,
-                "category": request.category or "Unknown",
-                "keywords": request.keywords or [],
-                "audience": request.audience or "Tech enthusiasts"
-            }
-        else:
-            topic_data = select_topic()
-            add_to_memory(topic_data)
-
-        research_data = research_topic(topic_data)
-
-        topic_data["research"] = research_data
-        script_data = write_script(topic_data)
-
-        review_result = review_script(script_data, research_data)
-
-        if not review_result["approved"] and review_result["score"] < 5:
-            script_data = write_script(topic_data)
-            review_result = review_script(script_data, research_data)
-
-        scenes = script_data["scenes"]
-        clips = fetch_all_clips(scenes)
-        voices = generate_all_voices(scenes)
-
-        asset_review = review_assets(clips, voices, scenes)
-
-        final_video = edit_video(scenes, clips, voices)
-
-        metadata = {}
-        publish_result = {}
-
-        if final_video:
-            metadata = generate_metadata(script_data, research_data)
-
-            if not request.skip_publish:
-                publish_result = publish_to_vayug(final_video, metadata)
-
-            # Sirf data save karo
-            add_pipeline_run(
-                topic=topic_data["topic"],
-                title=metadata.get("title", ""),
-                tags=metadata.get("tags", []),
-                video_url=publish_result.get("video", {}).get("videoUrl", ""),
-                status="success"
-            )
-
-            # Video DELETE karo
-            if os.path.exists(final_video):
-                os.remove(final_video)
-        else:
-            add_pipeline_run(
-                topic=topic_data["topic"],
-                title="",
-                tags=[],
-                video_url="",
-                status="failed"
-            )
-
-        return {
-            "success": True,
-            "data": {
-                "topic": topic_data,
-                "script": script_data,
-                "review": review_result,
-                "asset_review": asset_review,
-                "video_url": publish_result.get("video", {}).get("videoUrl", ""),
-                "metadata": metadata,
-                "publish": publish_result
-            }
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-@app.post("/pipeline/run")
-def run_pipeline(request: PipelineRequest, background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_full_pipeline_sync, request)
-    return {"success": True, "message": "Pipeline started in background"}
-
-
-@app.post("/pipeline/run-sync")
-def run_pipeline_sync(request: PipelineRequest):
-    result = run_full_pipeline_sync(request)
-    if result["success"]:
-        return result
-    else:
-        raise HTTPException(status_code=500, detail=result["error"])
-
-
-def notify_backend(callback_url: str, callback_secret: str, payload: dict):
-    """
-    Report generation result back to the Vayug backend webhook.
-    No-op if no callback_url was provided (e.g. direct /generate-sync calls).
-    Never raises — a failed notification must not crash the pipeline task.
-    """
-    if not callback_url:
-        return
-    try:
-        headers = {"Content-Type": "application/json"}
-        if callback_secret:
-            headers["x-vayug-webhook-secret"] = callback_secret
-        resp = requests.post(callback_url, json=payload, headers=headers, timeout=15)
-        log("CALLBACK", f"Notified backend [{resp.status_code}] status={payload.get('status')}")
-    except Exception as e:
-        log("CALLBACK", f"Failed to notify backend at {callback_url}: {e}")
-
-
-def run_generate_pipeline_sync(request: GenerateRequest):
-    try:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-        # Step 0: Enhance user prompt into full topic_data
-        topic_data = enhance_prompt(
-            user_prompt=request.prompt,
-            category=request.category,
-            audience=request.audience
+    if not request.prompt and not request.script:
+        raise HTTPException(status_code=400, detail="Provide a prompt or a script")
+    if request.script and len(request.script) > MAX_SCRIPT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Script too long (max {MAX_SCRIPT_CHARS} characters)"
         )
-        add_to_memory(topic_data)
+    if not storage_ready():
+        raise HTTPException(status_code=503, detail="Storage not configured")
 
-        # Step 1: Research Agent - Research the topic
-        research_data = research_topic(topic_data)
-
-        # Step 2: Content Agent - Write script
-        topic_data["research"] = research_data
-        script_data = write_script(topic_data)
-
-        # Step 3: Review Agent - Review the script
-        review_result = review_script(script_data, research_data)
-
-        if not review_result["approved"] and review_result["score"] < 5:
-            script_data = write_script(topic_data)
-            review_result = review_script(script_data, research_data)
-
-        scenes = script_data["scenes"]
-
-        # Step 4: Content Agent - Fetch clips and generate voice
-        clips = fetch_all_clips(scenes)
-        voices = generate_all_voices(scenes)
-
-        # Step 4.5: Review Agent - Check assets
-        asset_review = review_assets(clips, voices, scenes)
-
-        # Step 5: Content Agent - Edit video
-        final_video = edit_video(scenes, clips, voices)
-
-        metadata = {}
-        publish_result = {}
-        download_url = ""
-        download_key = ""
-
-        if final_video:
-            metadata = generate_metadata(script_data, research_data)
-
-            if not request.skip_publish:
-                publish_result = publish_to_vayug(final_video, metadata)
-
-            # Upload a durable MP4 copy for gallery download BEFORE deleting the
-            # local file (the HLS publish path leaves no downloadable MP4).
-            download_copy = upload_download_copy(final_video)
-            download_url = download_copy.get("url", "")
-            download_key = download_copy.get("key", "")
-
-            add_pipeline_run(
-                topic=topic_data["topic"],
-                title=metadata.get("title", ""),
-                tags=metadata.get("tags", []),
-                video_url=publish_result.get("video", {}).get("videoUrl", ""),
-                status="success"
-            )
-
-            if os.path.exists(final_video):
-                os.remove(final_video)
-        else:
-            add_pipeline_run(
-                topic=topic_data["topic"],
-                title="",
-                tags=[],
-                video_url="",
-                status="failed"
-            )
-
-        video_url = publish_result.get("video", {}).get("videoUrl", "")
-        video_id = publish_result.get("video", {}).get("id")
-
-        # Report result back to the Vayug backend (if it asked for a callback).
-        if video_url:
-            notify_backend(request.callback_url, request.callback_secret, {
-                "status": "completed",
-                "video_url": video_url,
-                "download_url": download_url,
-                "download_key": download_key,
-                "video_id": video_id,
-                "metadata": metadata,
-            })
-        else:
-            # Pipeline ran but produced no usable video URL (edit or publish failed).
-            notify_backend(request.callback_url, request.callback_secret, {
-                "status": "failed",
-                "error": "Video was generated but could not be published (no video URL).",
-            })
-
-        return {
-            "success": True,
-            "data": {
-                "topic": topic_data,
-                "script": script_data,
-                "review": review_result,
-                "asset_review": asset_review,
-                "video_url": video_url,
-                "metadata": metadata,
-                "publish": publish_result
-            }
-        }
-    except Exception as e:
-        # Report the failure back so the backend can mark the job failed
-        # instead of leaving it stuck in 'processing' forever.
-        notify_backend(request.callback_url, request.callback_secret, {
-            "status": "failed",
-            "error": str(e),
-        })
-        return {"success": False, "error": str(e)}
+    job = create_job(
+        user_id=request.user_id,
+        prompt=request.prompt or "",
+        script=request.script or "",
+    )
+    if not job:
+        raise HTTPException(status_code=500, detail="Could not create job")
+    return job
 
 
-@app.post("/generate")
-def generate_from_prompt(request: GenerateRequest, background_tasks: BackgroundTasks):
-    """Generate a video from a user prompt. Enhances the prompt and runs the full pipeline."""
-    background_tasks.add_task(run_generate_pipeline_sync, request)
-    return {"success": True, "message": "Video generation started from your prompt"}
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str, user_id: str, x_api_key: Optional[str] = Header(None)):
+    """Progress polling - app yahi se stage dikhata hai."""
+    require_key(x_api_key)
+    job = get_job(job_id, user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
 
 
-@app.post("/generate-sync")
-def generate_from_prompt_sync(request: GenerateRequest):
-    """Generate a video from a user prompt (synchronous)."""
-    result = run_generate_pipeline_sync(request)
-    if result["success"]:
-        return result
-    else:
-        raise HTTPException(status_code=500, detail=result["error"])
+@app.get("/jobs")
+def user_library(
+    user_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    x_api_key: Optional[str] = Header(None),
+):
+    """User ki banayi hui saari videos."""
+    require_key(x_api_key)
+    return {"jobs": list_jobs(user_id, limit=limit)}
+
+
+@app.delete("/jobs/{job_id}")
+def remove_job(job_id: str, user_id: str, x_api_key: Optional[str] = Header(None)):
+    """Library se video hatao - R2 se file bhi delete hoti hai."""
+    require_key(x_api_key)
+    job = delete_job(job_id, user_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("video_key"):
+        delete_video(job["video_key"])
+    return {"success": True}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))

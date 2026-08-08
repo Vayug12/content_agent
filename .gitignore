@@ -21,6 +21,7 @@ env/
 
 # Output files
 output/
+data/
 *.mp4
 *.mp3
 *.part
